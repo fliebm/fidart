@@ -42,8 +42,6 @@ def parse_args() -> argparse.Namespace:
                    help="Disable halos + aurora ribbons")
     p.add_argument("--no-audio",      action="store_true",
                    help="Disable audio input")
-    p.add_argument("--system-audio",  action="store_true",
-                   help="Capture system audio (speakers) instead of microphone")
     return p.parse_args()
 
 
@@ -59,9 +57,12 @@ def main() -> None:
         mode_str = f"SIM  n={args.n_fiducials}  fps={args.fps}"
 
     audio_device = None
-    if args.system_audio and not args.no_audio:
+    use_loopback = False
+    if not args.no_audio:
         audio_device = find_loopback_device()
-        if audio_device is None:
+        if audio_device is not None:
+            use_loopback = True
+        else:
             print("[Audio] pyaudiowpatch not installed — falling back to microphone\n"
                   "        Install with:  pip install pyaudiowpatch")
 
@@ -73,7 +74,7 @@ def main() -> None:
         show_overlays=not args.no_overlays,
         audio=not args.no_audio,
         audio_device=audio_device,
-        audio_loopback=args.system_audio and audio_device is not None,
+        audio_loopback=use_loopback,
     )
     if args.constellation:
         vis._constellation = True
