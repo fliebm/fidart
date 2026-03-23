@@ -15,6 +15,7 @@ import argparse
 from tracker.simulator import SimulatedTracker
 from tracker.sdk import SDKTracker
 from visualizer import Visualizer
+from audio import find_loopback_device
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,12 +34,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--seed",          type=int, default=None)
     p.add_argument("--serial",        type=int, default=None, metavar="SN")
     p.add_argument("--fullscreen",    action="store_true")
+    p.add_argument("--maximize",      action="store_true",
+                   help="Launch as maximized window (default on)")
     p.add_argument("--width",         type=int, default=1280)
     p.add_argument("--height",        type=int, default=720)
     p.add_argument("--no-overlays",   action="store_true",
                    help="Disable halos + aurora ribbons")
     p.add_argument("--no-audio",      action="store_true",
-                   help="Disable microphone input")
+                   help="Disable audio input")
+    p.add_argument("--system-audio",  action="store_true",
+                   help="Capture system audio (speakers) instead of microphone")
     return p.parse_args()
 
 
@@ -53,18 +58,32 @@ def main() -> None:
                                     fps=args.fps, seed=args.seed)
         mode_str = f"SIM  n={args.n_fiducials}  fps={args.fps}"
 
+    audio_device = None
+    if args.system_audio and not args.no_audio:
+        audio_device = find_loopback_device()
+        if audio_device is None:
+            print("[Audio] pyaudiowpatch not installed — falling back to microphone\n"
+                  "        Install with:  pip install pyaudiowpatch")
+
     vis = Visualizer(
         width=args.width,
         height=args.height,
         fullscreen=args.fullscreen,
+        maximize=args.maximize,
         show_overlays=not args.no_overlays,
         audio=not args.no_audio,
+        audio_device=audio_device,
+        audio_loopback=args.system_audio and audio_device is not None,
     )
     if args.constellation:
         vis._constellation = True
 
+    if not args.live:
+        vis.on_person_add    = tracker.add_person
+        vis.on_person_remove = tracker.remove_person
+
     print(f"fidart  |  {mode_str}")
-    print("Controls: M=constellation   G=overlays   F=fullscreen   Q=quit")
+    print("Controls: M=constellation   G=overlays   F=fullscreen   UP/DOWN=people   Q=quit")
 
     try:
         with tracker:

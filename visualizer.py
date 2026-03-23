@@ -1,36 +1,22 @@
-"""Visualizer — pygame orchestrator for the Luminous Flow visual engine.
+"""Visualizer — pygame + moderngl orchestrator for the 3D Luminous Flow engine.
 
-Blend philosophy
+Blend philosophy  (unchanged from 2-D version)
 ────────────────
-Rather than a fixed timer, the FLOW ↔ INTERFERENCE blend weight responds
-organically to what's happening on screen:
+  · Activity — smoothed fiducial world-space velocity.
+  · Mood     — four incommensurable sinusoidal oscillators (20/35/53/83 min).
+  blend_weight = slow EMA of (activity × 0.8 + mood × 0.2) ∈ [0, 1]
 
-  · **Activity** — smoothed fiducial screen velocity.  When people move fast,
-    interference energy rises; when they're still, the particle flow takes over.
+3-D additions
+─────────────
+  · Fiducials are kept in normalised world space (X:±1, Y:±0.5625, Z:0–2).
+  · Particles move in 3D; perspective projection makes near ones larger/brighter.
+  · Interference uses actual fiducial Z → spherical waves with depth-correct hue.
+  · Aurora ribbons and halos are screen-space overlays rendered via GPU lines.
 
-  · **Mood** — four incommensurable sinusoidal oscillators (periods 20 / 35 /
-    53 / 83 minutes) that drift independently and sum to a slowly wandering
-    background pressure.  Because the periods share no common factor, the
-    combination never exactly repeats during a 5-hour event.
-
-  blend_weight = slow EMA of (activity × 0.8 + mood × 0.2)  ∈ [0, 1]
-  τ ≈ 2 s at 30 fps → silky smooth, never mechanical.
-
-Horizontal / Vertical elements
-───────────────────────────────
-Each fiducial's screen velocity feeds update_planes() in the renderer.
-X-motion → horizontal sinusoidal stripes near the person's column.
-Y-motion → vertical stripes near the person's row.
-The structural layer persists ~3 s (decay 0.955/frame) and is composited
-on top of the blended FLOW+INTERFERENCE display — visible in both modes,
-bridging the transition with spatial structure.
-
-Controls
+Controls  (unchanged)
 ────────
-  M           — toggle CONSTELLATION (pauses organic blend while active)
-  G           — toggle fiducial halos + aurora ribbons
-  F           — toggle fullscreen
-  ESC / Q     — quit
+  M — toggle CONSTELLATION   G — toggle overlays
+  F — toggle fullscreen       ESC/Q — quit
 """
 from __future__ import annotations
 
@@ -40,47 +26,48 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pygame
+import moderngl
 
 from tracker.base import Frame
 from visual_engine import (
-    FlowField, ParticleSystem, LuminousRenderer,
+    FlowField3D, ParticleSystem3D, Renderer3D,
     GRID_W, GRID_H, N_PARTICLES,
+    WX, WY, WZ, TRAIL_DECAY,
+    world_to_screen, _hue_to_rgb_f,
 )
 from audio import AudioProcessor, AudioFeatures
+from image_overlay import ImageOverlay
 
-HUE_PERIOD      = 120.0   # seconds for full colour-palette rotation
-VORTEX_STRENGTH = 0.55
+HUE_PERIOD = 120.0
 
-# Four mood oscillators — incommensurable periods so the combo never repeats
-# (weight, period_seconds)
 _MOOD_WAVES: List[Tuple[float, float]] = [
-    (0.35, 20 * 60),   # 20 min
-    (0.25, 35 * 60),   # 35 min
-    (0.20, 53 * 60),   # 53 min
-    (0.20, 83 * 60),   # 83 min
+    (0.35, 20 * 60),
+    (0.25, 35 * 60),
+    (0.20, 53 * 60),
+    (0.20, 83 * 60),
 ]
 
 
 def _mood(t: float) -> float:
-    """Returns a slowly wandering value in [0, 1] — never mechanical."""
     val = sum(w * (math.sin(2 * math.pi * t / p) * 0.5 + 0.5)
               for w, p in _MOOD_WAVES)
-    # val ∈ [0, sum(weights)] = [0, 1] already since weights sum to 1.0
     return float(np.clip(val, 0.0, 1.0))
 
 
 class Visualizer:
-    """Immersive party visualizer."""
+    """Immersive 3D party visualizer."""
 
     def __init__(
         self,
         width: int  = 1280,
         height: int = 720,
         fullscreen: bool = False,
+        maximize: bool = False,
         show_overlays: bool = True,
         n_particles: int = N_PARTICLES,
         audio: bool = True,
-        # kept for API compatibility
+        audio_device = None,
+        audio_loopback: bool = False,
         trail_length: int = 0,
         show_glow: bool = True,
         show_particles: bool = True,
@@ -88,57 +75,91 @@ class Visualizer:
     ) -> None:
         self.width, self.height = width, height
         self._fullscreen    = fullscreen
+        self._maximize      = maximize
         self._show_overlays = show_overlays
         self._title         = title
-        self._constellation = False   # True = CONSTELLATION mode (M key)
+        self._constellation = False
 
-        self._flow_field = FlowField(GRID_W, GRID_H)
-        self._particles  = ParticleSystem(n_particles, width, height)
-        self._renderer   = LuminousRenderer(width, height)
-        self._audio      = AudioProcessor() if audio else None
+        self._flow_field = FlowField3D(GRID_W, GRID_H)
+        self._particles  = ParticleSystem3D(n_particles)
+        self._renderer:  Optional[Renderer3D] = None
+        self._ctx:       Optional[moderngl.Context] = None
+        self._audio = (AudioProcessor(device=audio_device, loopback=audio_loopback)
+                       if audio else None)
 
-        self._screen: Optional[pygame.Surface] = None
-        self._clock:  Optional[pygame.time.Clock] = None
-        self._t0: float = 0.0
-        self._frame_count: int = 0
+        self._screen = None
+        self._clock: Optional[pygame.time.Clock] = None
+        self._t0 = 0.0
+        self._frame_count = 0
 
-        # Organic blend state
-        self._prev_screen_pos: Dict[int, Tuple[float, float]] = {}
-        self._vel_smooth: Dict[int, Tuple[float, float]] = {}   # EMA velocities
-        self._activity: float = 0.0          # ∈ [0, 1] — mean speed normalised
-        self._blend_weight: float = 0.0      # current display blend weight
+        self._prev_world_pos: Dict[int, Tuple[float, float, float]] = {}
+        self._vel_smooth:     Dict[int, Tuple[float, float]] = {}
+        self._activity:       float = 0.0
+        self._blend_weight:   float = 0.0
+        self._fid_spin:       Dict[int, float] = {}
+        self._spin_counter:   int = 0
+        self._awake:          float = 0.0
+        self._energy_state:   float = 0.0
+        self._prev_beat:      float = 0.0
+        self._wave_rings:     list  = []   # [(birth_t, cx_ndc, cy_ndc, r, g, b)]
+        self._images = ImageOverlay()
 
-        # Per-fiducial spin (+1 CCW, -1 CW): assigned once when first seen.
-        # Alternating spins on nearby people create complex non-circular patterns.
-        self._fid_spin: Dict[int, float] = {}
-        self._spin_counter: int = 0
+        # Ghost constellation — occasional collage panel
+        self._ghost_active  = False
+        self._ghost_alpha   = 0.0          # smoothed 0..1
+        self._ghost_next_t  = float(np.random.uniform(20.0, 40.0))
+        self._ghost_end_t   = 0.0
+        self._ghost_rect    = (0, 0, 1, 1)  # (x, y_gl, w, h) in pixels; set on trigger
 
-        # Slumber / awake state: 0 = no one present, 1 = crowd fully active
-        # Wakes up quickly when people arrive; fades slowly when room empties
-        self._awake: float = 0.0
+        # Optional callbacks wired up by main.py
+        self.on_person_add:    Optional[callable] = None
+        self.on_person_remove: Optional[callable] = None
 
     # ── lifecycle ──────────────────────────────────────────────────────────────
 
     def open(self) -> None:
         pygame.init()
         pygame.display.set_caption(self._title)
-        flags = pygame.FULLSCREEN if self._fullscreen else pygame.RESIZABLE
+        flags = pygame.OPENGL | pygame.DOUBLEBUF
+        if self._fullscreen:
+            flags |= pygame.FULLSCREEN
+        else:
+            flags |= pygame.RESIZABLE
         self._screen = pygame.display.set_mode((self.width, self.height), flags)
         self._clock  = pygame.time.Clock()
-        self._renderer.init_surfaces()
+
+        if self._maximize:
+            import ctypes
+            import ctypes.wintypes
+            hwnd = pygame.display.get_wm_info()['window']
+            ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+            # Read actual client area so the renderer uses the real pixel dimensions
+            rect = ctypes.wintypes.RECT()
+            ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+            w, h = rect.right - rect.left, rect.bottom - rect.top
+            if w > 0 and h > 0:
+                self.width, self.height = w, h
+
+        self._ctx      = moderngl.create_context()
+        self._renderer = Renderer3D(self._ctx, self.width, self.height)
+        self._renderer.init()
+
         if self._audio:
             self._audio.open()
         self._t0 = time.perf_counter()
 
-        # Pre-warm: develop the flow field so first frame looks good.
-        # Use fast single-pixel splat — multi-size is only needed at runtime.
+        # Pre-warm
         print("[Visualizer] pre-warming …", end=" ", flush=True)
         for step in range(120):
             t = step / 30.0
             self._flow_field.update(t, [])
             self._particles.update(self._flow_field, [], pulse=0.0)
             if step > 40:
-                self._renderer.splat_particles(self._particles, 2.0)
+                self._particles.upload_to(self._renderer._particle_vbo)
+                self._renderer._flow_fbos[self._renderer._flow_idx][0].use()
+                self._ctx.blend_func = moderngl.ONE, moderngl.ONE
+                self._renderer._progs['particle']['u_brightness'] = 1.0
+                self._renderer._particle_vao.render(moderngl.POINTS)
         print("done")
 
     def close(self) -> None:
@@ -150,44 +171,56 @@ class Visualizer:
     def __enter__(self):  self.open();  return self
     def __exit__(self, *_): self.close()
 
+    # ── helpers ────────────────────────────────────────────────────────────────
+
+    def _normalize_fid(self, fid) -> Tuple[float, float, float]:
+        wx = float(np.clip( fid.x / 700.0,             -WX,  WX))
+        wy = float(np.clip( fid.y / 400.0 * WY,        -WY,  WY))
+        wz = float(np.clip((fid.z - 300.0) / 1700.0 * WZ, 0.0, WZ))
+        return wx, wy, wz
+
     # ── per-frame update ───────────────────────────────────────────────────────
 
     def update(self, frame: Frame) -> bool:
-        """Feed one tracking frame.  Returns False when the user quits."""
         if not self._handle_events():
             return False
 
         t   = time.perf_counter() - self._t0
         fps = self._clock.get_fps() if self._clock else 0.0
 
-        # ── audio features ────────────────────────────────────────────────
+        # Audio
         af = self._audio.features if self._audio else AudioFeatures()
 
-        # ── global colour + breathing pulse ───────────────────────────────
-        # Bass replaces the slow sine pulse — each kick drum = visual burst.
-        # Centroid speeds up hue rotation: bright/trebly sound = fast cycling.
+        # Audio energy state (calm ↔ party)
+        af_energy = af.energy if self._audio else 0.0
+        if af_energy > self._energy_state:
+            self._energy_state = self._energy_state * 0.85 + af_energy * 0.15
+        else:
+            self._energy_state = self._energy_state * 0.998 + af_energy * 0.002
+
+        # Pulse — only kick/bass drives it; highs and onset ignored
         pulse_sine = (math.sin(t * math.pi * 0.5) * 0.5 + 0.5) ** 2
-        pulse      = max(pulse_sine * 0.35, af.bass * 0.85 + af.beat * 0.45)
-        hue_speed  = 1.0 + af.centroid * 3.5
+        sub_bass   = af.sub_bass if self._audio else 0.0
+        pulse      = max(pulse_sine * 0.20, sub_bass * 0.8 + af.beat * 0.35)
+        hue_speed  = 1.0 + self._energy_state * 0.8   # slow drift; no high/centroid influence
         global_hue = (t * hue_speed / HUE_PERIOD) % 1.0
 
-        # ── fiducial projection + velocity tracking ────────────────────────
+        # Build fiducial world-space list
         n_fid = max(len(frame.fiducials), 1)
-        fid_screen: List[Tuple[float, float, float]] = []
-        fid_grid:   List[Tuple[float, float, float]] = []
-        fid_vels:   List[Tuple[float, float]] = []
+        fid_world: List[Tuple[float, float, float, float]] = []
+        fid_grid:  list = []
+        fid_vels:  List[Tuple[float, float]] = []
 
         for fid in frame.fiducials:
-            hue = (fid.index / n_fid + global_hue) % 1.0
-            sx, sy = self._project(fid)
-            fid_screen.append((sx, sy, hue))
+            hue_f = (fid.index / n_fid + global_hue) % 1.0
+            wx, wy, wz = self._normalize_fid(fid)
+            fid_world.append((wx, wy, wz, hue_f))
 
-            # Per-fiducial EMA velocity (screen pixels/frame)
             idx = fid.index
-            if idx in self._prev_screen_pos:
-                px0, py0 = self._prev_screen_pos[idx]
-                raw_vx = sx - px0
-                raw_vy = sy - py0
+            if idx in self._prev_world_pos:
+                px0, py0, pz0 = self._prev_world_pos[idx]
+                raw_vx = wx - px0
+                raw_vy = wy - py0
                 if idx in self._vel_smooth:
                     evx, evy = self._vel_smooth[idx]
                     evx = evx * 0.7 + raw_vx * 0.3
@@ -198,138 +231,175 @@ class Visualizer:
                 fid_vels.append((evx, evy))
             else:
                 fid_vels.append((0.0, 0.0))
-            self._prev_screen_pos[idx] = (sx, sy)
+            self._prev_world_pos[idx] = (wx, wy, wz)
 
-            # Per-fiducial energy ∈ [0,1] from smoothed speed.
             evx, evy = self._vel_smooth.get(idx, (0.0, 0.0))
-            energy = float(np.clip(math.hypot(evx, evy) / 55.0, 0.0, 1.0))
+            energy = float(np.clip(math.hypot(evx, evy) / 0.009, 0.0, 1.0))
 
-            # Spin: assign once per new fiducial, alternating CW/CCW
             if idx not in self._fid_spin:
                 self._fid_spin[idx] = 1.0 if self._spin_counter % 2 == 0 else -1.0
                 self._spin_counter += 1
             spin = self._fid_spin[idx]
 
-            # Normalised velocity direction for directional wake in flow field
             spd = math.hypot(evx, evy)
-            vdx = evx / spd if spd > 0.5 else 0.0
-            vdy = evy / spd if spd > 0.5 else 0.0
+            vdx = evx / spd if spd > 5e-5 else 0.0
+            vdy = evy / spd if spd > 5e-5 else 0.0
 
-            # Field strength: sitting=0.12, dancing=1.72
             vortex_str = 0.12 + energy * 1.6
-            gx = sx / self.width  * (GRID_W - 1)
-            gy = sy / self.height * (GRID_H - 1)
+            gx = (wx + WX) / (2 * WX) * (GRID_W - 1)
+            gy = (wy + WY) / (2 * WY) * (GRID_H - 1)
             fid_grid.append((gx, gy, vortex_str, vdx, vdy, energy, spin))
 
-        # ── awake / slumber ───────────────────────────────────────────────
-        # Presence: 4+ fiducials = fully awake.  Loud music also wakes the
-        # visuals — so an empty dance floor with music is still alive.
-        target_awake = float(np.clip(len(fid_screen) / 4.0, 0.0, 1.0))
-        target_awake = max(target_awake, af.rms * 0.65)
-        if target_awake > self._awake:
-            self._awake = self._awake * 0.967 + target_awake * 0.033  # fast wake
-        else:
-            self._awake = self._awake * 0.996 + target_awake * 0.004  # slow sleep
+        # Beat events → one wave ring on a single random fiducial, only on strong kicks
+        if af.beat > 0.82 and self._prev_beat <= 0.82 and fid_world:
+            wx, wy, wz, fh = fid_world[int(np.random.randint(0, len(fid_world)))]
+            sx, sy = world_to_screen(wx, wy, wz, self.width, self.height)
+            cx_ndc = sx / self.width  * 2 - 1
+            cy_ndc = 1 - sy / self.height * 2
+            r, g, b = _hue_to_rgb_f(fh)
+            self._wave_rings.append((t, cx_ndc, cy_ndc, r, g, b))
+        self._prev_beat = af.beat
+        # Cull expired rings
+        self._wave_rings = [(bt, x, y, r, g, b) for bt, x, y, r, g, b in self._wave_rings
+                            if t - bt < 2.5]
 
-        # ── per-fiducial energies (for renderer) ──────────────────────────
+        # Awake — driven by fiducial count only; no audio floor (no people = dark)
+        target_awake = float(np.clip(len(fid_world) / 4.0, 0.0, 1.0))
+        if target_awake > self._awake:
+            self._awake = self._awake * 0.967 + target_awake * 0.033
+        else:
+            self._awake = self._awake * 0.996 + target_awake * 0.004
+
+        # Per-fiducial energies
         fid_energies = [
-            float(np.clip(math.hypot(*self._vel_smooth.get(fid.index, (0.0, 0.0))) / 55.0,
-                          0.0, 1.0))
+            float(np.clip(math.hypot(*self._vel_smooth.get(fid.index, (0.0, 0.0)))
+                          / 0.009, 0.0, 1.0))
             for fid in frame.fiducials
         ]
 
-        # ── activity: mean energy across all present fiducials ────────────
+        # Activity
         if fid_energies:
             target_activity = float(np.clip(np.mean(fid_energies) * 2.5, 0.0, 1.0))
         else:
             target_activity = 0.0
-        self._activity = self._activity * 0.92 + target_activity * 0.08  # τ≈12f
+        self._activity = self._activity * 0.92 + target_activity * 0.08
 
-        # ── organic blend weight ──────────────────────────────────────────
+        # Organic blend weight — only kick/bass energy shifts toward INTERFERENCE
         if not self._constellation:
-            mood        = _mood(t)
+            mood         = _mood(t)
             blend_target = float(np.clip(
-                self._activity * 0.8 + (mood - 0.5) * 0.5, 0.0, 1.0))
-            # Slow EMA: τ ≈ 2 s at 30 fps
-            self._blend_weight = self._blend_weight * 0.985 + blend_target * 0.015
-            # Beat kick: each beat nudges the blend sharply toward interference
-            # — the display flashes with the drum hit — then drifts back organically
-            self._blend_weight = min(1.0, self._blend_weight + af.beat * 0.22)
+                self._activity * 0.3 + (mood - 0.5) * 0.2
+                + self._energy_state * 0.45, 0.0, 1.0))
+            self._blend_weight = self._blend_weight * 0.988 + blend_target * 0.012
+            self._blend_weight = min(1.0, self._blend_weight + af.beat * 0.15)
+            # Calm = drift firmly back to FLOW
+            if self._energy_state < 0.20:
+                self._blend_weight = self._blend_weight * 0.987
 
         blend_weight = self._blend_weight
 
-        # ── simulation (always runs) ───────────────────────────────────────
+        # Brightness — calm resting state, beat/bass lifts it
+        a              = self._awake
+        e              = self._energy_state
+        # All brightness is proportional to presence — fades to near-zero with no people
+        bloom_live      = a * 0.28 + e * 0.18 + pulse * a * 0.18 + af.beat * a * 0.15
+        particle_bright = 0.05 + a * 0.75 + e * 0.25 + af.beat * a * 0.18
+
+        # Simulation — energy_state scales motion; calm = dreamily slow
+        e              = self._energy_state
+        speed_scale    = 0.35 + e * 0.65          # 0.35 at silence → long dreamy streaks; 1.0 at party
+        trail_decay    = TRAIL_DECAY + (1.0 - e) * 0.050   # calmer = longer persistent trails
         self._flow_field.update(t, fid_grid)
-        self._particles.update(self._flow_field, fid_screen, pulse=pulse)
+        self._particles.update(self._flow_field, fid_world, pulse=pulse,
+                               speed_scale=speed_scale)
 
-        # ── structural plane waves + spatial energy map ───────────────────
-        fid_screen_vels = list(zip(fid_screen, fid_vels))
-        self._renderer.update_planes(fid_screen_vels, t)
-        # Audio-driven global bands (bass breathes, high shimmers)
-        self._renderer.update_audio_planes(af.bass, af.high, t)
-        # Energy map: (sx, sy, energy) — drives per-pixel brightness modulation
-        fid_screen_energies = [(sx, sy, e)
-                               for (sx, sy, _), e in zip(fid_screen, fid_energies)]
-        self._renderer.update_energy_map(fid_screen_energies)
+        # Energy map
+        fid_world_energies = [(wx, wy, wz, e)
+                              for (wx, wy, wz, _), e in zip(fid_world, fid_energies)]
+        self._renderer.update_energy_map(fid_world_energies)
 
-        # ── render ────────────────────────────────────────────────────────
-        # In slumber: dim bloom, very faint particles, slow ambient pulse only.
-        # As crowd grows, everything brightens and energises.
-        a = self._awake
-        bloom_live        = (0.06 + a * 0.40) + pulse * (a * 0.18)
-        particle_bright   = 0.3 + a * 1.7      # 0.3 (slumber) → 2.0 (full)
-
+        # Render
         if self._constellation:
-            self._renderer.render_constellation(
-                fid_screen, self._particles, global_hue)
-            blend_weight = 0.0
+            self._renderer.clear_interf()
+            self._renderer.render_constellation(fid_world, self._particles, global_hue)
+            self._renderer.composite(0.0, bloom_live, constellation=True)
         else:
-            # Only compute a buffer when it contributes visibly (> 2 %).
-            # The non-active buffer still decays so it fades gracefully when
-            # it re-enters the blend.
             if blend_weight < 0.98:
-                self._renderer.splat_particles(self._particles, particle_bright)
+                self._renderer.splat_particles(self._particles, particle_bright,
+                                               trail_decay=trail_decay)
             else:
-                self._renderer._buf_flow *= 0.935   # decay only
+                self._renderer.decay_flow()
 
             if blend_weight > 0.02:
-                # Mid frequencies speed up the interference wave propagation
                 t_interf = t * (1.0 + af.mid * 0.55)
-                self._renderer.render_interference(fid_screen, t_interf, global_hue,
-                                                   fid_energies)
+                self._renderer.render_interference(
+                    fid_world, t_interf, global_hue, fid_energies, a)
             else:
-                self._renderer._buf_interf *= 0.72  # decay only
+                self._renderer.decay_interf()
 
-        display = self._renderer.get_display_array(blend_weight, bloom_live)
-        pygame.surfarray.blit_array(self._screen, display.transpose(1, 0, 2))
+            self._renderer.composite(blend_weight, bloom_live)
 
-        # ── overlays ──────────────────────────────────────────────────────
+        # Ghost constellation collage — only in flow mode, not when user forced constellation
+        if not self._constellation:
+            if self._ghost_active and t >= self._ghost_end_t:
+                self._ghost_active = False
+                self._ghost_next_t = t + float(np.random.uniform(20.0, 45.0))
+            elif not self._ghost_active and t >= self._ghost_next_t:
+                self._ghost_active = True
+                dur = float(np.random.uniform(0.8, 1.3))
+                self._ghost_end_t  = t + dur
+                self._ghost_rect   = self._pick_ghost_rect()
+            self._ghost_alpha = 0.55 if self._ghost_active else 0.0
+            if self._ghost_alpha > 0.0:
+                self._renderer.render_ghost_constellation(
+                    fid_world, self._particles, global_hue)
+                self._renderer.draw_ghost_constellation(
+                    self._ghost_alpha, self._ghost_rect)
+
+        # NYC image ghost — fades in/out over tens of seconds
+        self._images.update(t)
+        if self._images.ready:
+            rgba, iw, ih = self._images.image
+            self._renderer.draw_image_overlay(rgba, iw, ih,
+                                              self._images.alpha, global_hue)
+
+        # Overlays (rendered additively on top of composite)
         if self._show_overlays:
-            self._renderer.draw_aurora_ribbons(self._screen, fid_screen, t)
-            self._renderer.draw_halos(self._screen, fid_screen, t, pulse)
+            self._renderer.draw_fiducial_spheres(fid_world, sub_bass=sub_bass, beat=af.beat)
+            self._renderer.draw_velocity_bars(fid_world, fid_vels, self.width, self.height)
+            self._renderer.draw_aurora_ribbons(fid_world, t, self.width, self.height)
+            self._renderer.draw_halos(fid_world, t, pulse, self.width, self.height,
+                                      sub_bass=sub_bass, beat=af.beat)
+            self._renderer.draw_wave_rings(self._wave_rings, t, self.width, self.height)
 
-        self._draw_hud(fid_screen, fps, t, blend_weight)
+        # HUD
+        self._draw_hud(fid_world, fps, t, blend_weight, af)
+
         pygame.display.flip()
         self._clock.tick(0)
         self._frame_count += 1
         return True
 
-    # ── helpers ────────────────────────────────────────────────────────────────
+    def _pick_ghost_rect(self) -> tuple:
+        """Return a random (x, y_gl, w, h) scissor rect in OpenGL pixel coords.
 
-    def _project(self, fid) -> Tuple[float, float]:
-        focal = 900.0
-        z_safe = max(fid.z, 1.0)
-        sx = self.width  / 2 + fid.x * focal / z_safe
-        sy = self.height / 2 - fid.y * focal / z_safe
-        sx = float(np.clip(sx, self.width  * 0.05, self.width  * 0.95))
-        sy = float(np.clip(sy, self.height * 0.05, self.height * 0.95))
-        return sx, sy
+        OpenGL y=0 is at the bottom, so 'top half of screen' = y_gl = h//2.
+        """
+        W, H = self.width, self.height
+        options = [
+            (0,      0,      W // 2, H),          # left half
+            (W // 2, 0,      W // 2, H),          # right half
+            (0,      H // 2, W,      H // 2),     # top half
+            (0,      0,      W,      H // 2),     # bottom half
+            (0,      0,      W // 3, H),          # left third
+            (W*2//3, 0,      W // 3, H),          # right third
+            (W // 4, H // 4, W // 2, H // 2),    # centre quadrant
+            (0,      H // 3, W*2//3, H*2//3),    # upper-left two-thirds
+        ]
+        return options[int(np.random.randint(0, len(options)))]
 
-    def _draw_hud(self, fid_screen, fps: float, t: float,
-                  blend_weight: float) -> None:
-        font = self._renderer._font
-        if font is None:
-            return
+    def _draw_hud(self, fid_world, fps: float, t: float,
+                  blend_weight: float, af: AudioFeatures) -> None:
         if self._constellation:
             mode_str = "CONSTELLATION"
         else:
@@ -344,22 +414,40 @@ class Visualizer:
                 blend_str = f"FLOW <{pct:3d}%> INTERF"
             slumber_str = "" if self._awake > 0.85 else f"  zz[{awake_bar}]"
             mode_str = f"{blend_str}  act[{act_bar}]{slumber_str}"
-        # Audio meter: show bass/beat when audio is active
-        if self._audio and self._audio._active:
-            af_hud = self._audio.features
-            b_bar  = "|" * int(af_hud.bass * 6) + "." * (6 - int(af_hud.bass * 6))
-            h_bar  = "|" * int(af_hud.high * 6) + "." * (6 - int(af_hud.high * 6))
-            beat_s = "*BEAT*" if af_hud.beat > 0.3 else "  -  "
-            audio_str = f"  audio bass[{b_bar}] hi[{h_bar}] {beat_s}"
-        else:
-            audio_str = ""
+
+        audio_str = ""
+        if self._audio:
+            sb_bar = "|" * int(af.sub_bass * 6) + "." * (6 - int(af.sub_bass * 6))
+            h_bar  = "|" * int(af.high    * 6) + "." * (6 - int(af.high    * 6))
+            e_bar  = "|" * int(self._energy_state * 8) + "." * (8 - int(self._energy_state * 8))
+            beat_s = "*BEAT*" if af.beat > 0.3 else "  -  "
+            audio_str = f"  kick[{sb_bar}] hi[{h_bar}] nrg[{e_bar}] {beat_s}"
+
         lines = [
-            f"{mode_str}  |  fids: {len(fid_screen)}  |  fps: {fps:.0f}{audio_str}",
+            f"{mode_str}  |  fids: {len(fid_world)}  |  fps: {fps:.0f}{audio_str}",
             "M=constellation   G=overlays   F=fullscreen   Q=quit",
         ]
-        for i, line in enumerate(lines):
-            surf = font.render(line, True, (90, 90, 90))
-            self._screen.blit(surf, (12, 10 + i * 20))
+
+        # Floating 3-D coordinate labels — randomly on ~25% of fiducials,
+        # refreshed every 4 s so they drift from one fiducial to the next.
+        fid_labels = []
+        if fid_world:
+            slot = int(t / 4.0)
+            rng  = np.random.default_rng(slot)
+            n    = max(1, len(fid_world) // 4)
+            idxs = rng.choice(len(fid_world), size=min(n, len(fid_world)),
+                              replace=False)
+            for i in idxs:
+                wx, wy, wz, fh = fid_world[i]
+                sx, sy = world_to_screen(wx, wy, wz, self.width, self.height)
+                r, g, b = _hue_to_rgb_f(fh)
+                # Convert normalised world → mm (inverse of _normalize_fid)
+                xmm = wx * 700.0
+                ymm = wy / WY * 400.0
+                zmm = wz / WZ * 1700.0 + 300.0
+                fid_labels.append((sx, sy, xmm, ymm, zmm, r, g, b))
+
+        self._renderer.draw_hud_surface(lines, fid_labels=fid_labels)
 
     def _handle_events(self) -> bool:
         for ev in pygame.event.get():
@@ -370,16 +458,21 @@ class Visualizer:
                     return False
                 if ev.key == pygame.K_m:
                     self._constellation = not self._constellation
-                    self._renderer._buf_flow[:]   = 0
-                    self._renderer._buf_interf[:] = 0
-                    self._renderer._voronoi_cache = None
-                    label = "CONSTELLATION" if self._constellation else "FLOW↔INTERFERENCE"
-                    print(f"[Visualizer] mode → {label}")
+                    self._renderer.clear_flow()
+                    self._renderer.clear_interf()
+                    self._renderer.invalidate_voronoi()
+                    label = "CONSTELLATION" if self._constellation else "FLOW<->INTERFERENCE"
+                    print(f"[Visualizer] mode -> {label}")
+                if ev.key == pygame.K_UP and self.on_person_add:
+                    self.on_person_add()
+                if ev.key == pygame.K_DOWN and self.on_person_remove:
+                    self.on_person_remove()
                 if ev.key == pygame.K_g:
                     self._show_overlays = not self._show_overlays
                 if ev.key == pygame.K_f:
                     self._fullscreen = not self._fullscreen
-                    flags = pygame.FULLSCREEN if self._fullscreen else pygame.RESIZABLE
+                    flags = (pygame.OPENGL | pygame.DOUBLEBUF |
+                             (pygame.FULLSCREEN if self._fullscreen else pygame.RESIZABLE))
                     self._screen = pygame.display.set_mode(
                         (self.width, self.height), flags)
             if ev.type == pygame.VIDEORESIZE:

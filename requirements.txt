@@ -1,6 +1,9 @@
 numpy>=1.24
 scipy>=1.10
 pygame>=2.4
-sounddevice>=0.4   # microphone input — optional but recommended
+moderngl>=0.3.0
+sounddevice>=0.4    # microphone input
+pyaudiowpatch>=0.2  # Windows WASAPI loopback (system audio) — optional
+Pillow>=9.0         # NYC image overlay — optional (pip install Pillow)
 # Real camera (optional):
 # Install from SDK:  pip install "C:/Program Files/Atracsys/spryTrack SDK x64/python/atracsys-*.tar.gz"

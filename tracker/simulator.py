@@ -24,25 +24,26 @@ import numpy as np
 
 from .base import Fiducial3D, Frame, TrackerBase
 
-# ── working volume ─────────────────────────────────────────────────────────────
-Z_MIN, Z_MAX = 500.0, 2000.0
-X_HALF = 600.0
-Y_HALF = 350.0
+# ── working volume — spryTrack 300 ─────────────────────────────────────────────
+# Baseline ~300 mm, max depth ~3000 mm, ~60° H-FOV → ±1500 mm at max depth
+Z_MIN, Z_MAX = 300.0, 3000.0
+X_HALF = 1500.0
+Y_HALF = 850.0
 
 # ── behavior mode parameters ───────────────────────────────────────────────────
 #           amp_scale  freq_scale  burst_prob  min_dur  max_dur (seconds)
 _BEHAVIOR_PARAMS = {
-    'sitting': (0.06,  0.20, 0.000, 20, 120),
-    'walking': (0.40,  0.60, 0.001, 10,  45),
-    'dancing': (1.60,  1.80, 0.012,  8,  35),
+    'sitting': (0.04,  0.12, 0.000, 60, 240),   # nearly still, very long
+    'walking': (0.22,  0.35, 0.000, 30, 120),   # slow drift, no bursts
+    'dancing': (0.80,  0.90, 0.004, 20,  70),   # moderate movement
 }
 # How often each behavior is chosen (weights for sitting/walking/dancing)
-_BEHAVIOR_WEIGHTS = [0.20, 0.35, 0.45]
+_BEHAVIOR_WEIGHTS = [0.40, 0.40, 0.20]
 
 # ── crowd dynamics ─────────────────────────────────────────────────────────────
-_SCENE_MAX_PEOPLE   = 25
-_SCENE_MEAN_DURATION = 15.0   # short → frequent dramatic swings
-_CROWD_CHANGE_INTERVAL = 0.5  # seconds — fast arrivals/departures
+_SCENE_MAX_PEOPLE    = 25
+_SCENE_MEAN_DURATION = 45.0   # longer scenes — crowd stays put
+_CROWD_CHANGE_INTERVAL = 2.0  # seconds — slower arrivals/departures
 
 
 class _Person:
@@ -68,15 +69,15 @@ class _Person:
 
         # Base sinusoidal motion (phases, frequencies, amplitudes)
         self._phases = rng.uniform(0, 2*math.pi, size=(2, 6))
-        self._base_freqs  = np.array([0.08, 0.13, 0.21, 0.05, 0.17, 0.09])
-        self._base_amps_x = rng.uniform(50, 200, size=6).astype(np.float32)
-        self._base_amps_y = rng.uniform(30, 120, size=6).astype(np.float32)
-        self._base_amps_z = rng.uniform(40, 150, size=6).astype(np.float32)
+        self._base_freqs  = np.array([0.02, 0.04, 0.06, 0.015, 0.035, 0.025])  # very slow
+        self._base_amps_x = rng.uniform(15, 60, size=6).astype(np.float32)     # small range
+        self._base_amps_y = rng.uniform(10, 35, size=6).astype(np.float32)
+        self._base_amps_z = rng.uniform(15, 60, size=6).astype(np.float32)
 
         # Home position
         self._cx = float(rng.uniform(-X_HALF*0.65, X_HALF*0.65))
         self._cy = float(rng.uniform(-Y_HALF*0.65, Y_HALF*0.65))
-        self._cz = float(rng.uniform(700.0, 1500.0))
+        self._cz = float(rng.uniform(500.0, 2500.0))
 
         # Behavior state
         self._behavior     = 'walking'
@@ -292,6 +293,25 @@ class SimulatedTracker(TrackerBase):
         self._frame_idx += 1
         return Frame(fiducials=fiducials, timestamp_us=timestamp_us,
                      frame_index=self._frame_idx)
+
+    def add_person(self) -> None:
+        """Manually add one person and lock the scene target."""
+        p = self._new_person()
+        self._people.append(p)
+        self._scene_target = len(self._people)
+        n_fids = sum(pp.n_fids for pp in self._people)
+        print(f"[SimulatedTracker] +1 manual ({p.behavior:7s} {p.n_fids}fids)"
+              f" -> {len(self._people)} people / {n_fids} fids")
+
+    def remove_person(self) -> None:
+        """Manually remove one person and lock the scene target."""
+        if not self._people:
+            return
+        gone = self._people.pop(int(self._rng.integers(0, len(self._people))))
+        self._scene_target = len(self._people)
+        n_fids = sum(pp.n_fids for pp in self._people)
+        print(f"[SimulatedTracker] -1 manual"
+              f" -> {len(self._people)} people / {n_fids} fids")
 
     def close(self) -> None:
         print("[SimulatedTracker] closed")
