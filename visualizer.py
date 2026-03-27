@@ -270,12 +270,13 @@ class Visualizer:
         else:
             self._awake = self._awake * 0.996 + target_awake * 0.004
 
-        # Per-fiducial energies
+        # Per-fiducial energies and calm (inverse of movement)
         fid_energies = [
             float(np.clip(math.hypot(*self._vel_smooth.get(fid.index, (0.0, 0.0)))
                           / 0.009, 0.0, 1.0))
             for fid in frame.fiducials
         ]
+        fid_calms = [float(max(0.0, 1.0 - e * 2.5)) for e in fid_energies]
 
         # Activity
         if fid_energies:
@@ -365,10 +366,10 @@ class Visualizer:
 
         # Overlays (rendered additively on top of composite)
         if self._show_overlays:
-            self._renderer.draw_fiducial_spheres(fid_world, sub_bass=sub_bass, beat=af.beat)
+            self._renderer.draw_fiducial_spheres(fid_world, fid_calms, sub_bass=sub_bass, beat=af.beat)
             self._renderer.draw_velocity_bars(fid_world, fid_vels, self.width, self.height)
             self._renderer.draw_aurora_ribbons(fid_world, t, self.width, self.height)
-            self._renderer.draw_halos(fid_world, t, pulse, self.width, self.height,
+            self._renderer.draw_halos(fid_world, fid_calms, t, pulse, self.width, self.height,
                                       sub_bass=sub_bass, beat=af.beat)
             self._renderer.draw_wave_rings(self._wave_rings, t, self.width, self.height)
 

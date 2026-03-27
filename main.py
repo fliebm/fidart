@@ -1,19 +1,22 @@
 """fidart — spryTrack 300 party visualizer.
 
 Usage:
-  python main.py                    # 6 simulated people
-  python main.py -n 10              # 10 people
+  python main.py                    # simulated crowd (default)
+  python main.py -n 10              # 10 starting people
+  python main.py --live             # real spryTrack 300 IR camera
+  python main.py --rgb              # webcam + YOLO pose tracking
+  python main.py --rgb --camera 1   # second webcam
   python main.py --constellation    # start in CONSTELLATION mode
   python main.py --fullscreen       # start fullscreen (ideal for projection)
   python main.py --fps 60           # simulation frame rate
   python main.py --seed 42          # reproducible simulation
-  python main.py --live             # real spryTrack 300 camera
-  python main.py --serial 12345678  # specific camera serial number
+  python main.py --serial 12345678  # specific spryTrack serial number
 """
 import argparse
 
 from tracker.simulator import SimulatedTracker
 from tracker.sdk import SDKTracker
+from tracker.rgb_camera import RGBCameraTracker
 from visualizer import Visualizer
 from audio import find_loopback_device
 
@@ -25,7 +28,15 @@ def parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     p.add_argument("--live",          action="store_true",
-                   help="Use real spryTrack 300 camera")
+                   help="Use real spryTrack 300 IR camera")
+    p.add_argument("--rgb",           action="store_true",
+                   help="Use webcam + YOLO pose tracking (pip install ultralytics opencv-python)")
+    p.add_argument("--camera",        type=int, default=0, metavar="IDX",
+                   help="Webcam index for --rgb mode (default: 0)")
+    p.add_argument("--depth-scale",   type=float, default=250000.0, metavar="D",
+                   help="Depth tuning for --rgb: Z ≈ D / box_height_px (default: 250000)")
+    p.add_argument("--debug",         action="store_true",
+                   help="Show separate OpenCV debug window (--rgb only)")
     p.add_argument("-n", "--n-fiducials", type=int, default=6, metavar="N",
                    help="Simulated party-goers (default: 6)")
     p.add_argument("--constellation", action="store_true",
@@ -51,6 +62,12 @@ def main() -> None:
     if args.live:
         tracker  = SDKTracker(serial_number=args.serial)
         mode_str = f"LIVE  SN={args.serial or 'auto'}"
+    elif args.rgb:
+        tracker  = RGBCameraTracker(camera_index=args.camera,
+                                    fps=args.fps,
+                                    depth_scale=args.depth_scale,
+                                    debug=args.debug)
+        mode_str = f"RGB  camera={args.camera}  fps={args.fps}"
     else:
         tracker  = SimulatedTracker(n_fiducials=args.n_fiducials,
                                     fps=args.fps, seed=args.seed)
@@ -79,7 +96,7 @@ def main() -> None:
     if args.constellation:
         vis._constellation = True
 
-    if not args.live:
+    if not args.live and not args.rgb:
         vis.on_person_add    = tracker.add_person
         vis.on_person_remove = tracker.remove_person
 

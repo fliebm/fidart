@@ -5,5 +5,8 @@ moderngl>=0.3.0
 sounddevice>=0.4    # microphone input
 pyaudiowpatch>=0.2  # Windows WASAPI loopback (system audio) — optional
 Pillow>=9.0         # NYC image overlay — optional (pip install Pillow)
-# Real camera (optional):
+# RGB camera tracking (optional — pip install ultralytics opencv-python):
+# ultralytics>=8.0   # YOLO pose estimation (auto-downloads model on first run)
+# opencv-python>=4.8
+# Real IR camera (optional):
 # Install from SDK:  pip install "C:/Program Files/Atracsys/spryTrack SDK x64/python/atracsys-*.tar.gz"

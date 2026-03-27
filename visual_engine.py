@@ -193,16 +193,22 @@ uniform float u_sub_bass;
 uniform float u_beat;
 in vec3  a_pos;
 in float a_hue;
+in float a_calm;   // 1=still, 0=moving — controls prominence when quiet
 out vec3  v_color;
 out float v_saturation;
+out float v_calm;
 """ + _GLSL_HSV + """
 void main() {
     gl_Position  = u_mvp * vec4(a_pos, 1.0);
     float depth  = max(gl_Position.w, 0.1);
-    float base   = 32.0 + u_sub_bass * 22.0 + u_beat * 10.0;
+    // Still fiducials: bigger steady dot.  Moving: normal, audio-reactive.
+    float base   = 28.0 + a_calm * 22.0
+                        + u_sub_bass * 20.0 * (1.0 - a_calm * 0.5)
+                        + u_beat * 10.0;
     gl_PointSize = base / depth;
     v_color      = hsv2rgb(a_hue, 0.82, 1.0);
     v_saturation = 0.82;
+    v_calm       = a_calm;
 }
 """
 
@@ -210,6 +216,7 @@ _FRAG_SPHERE = """
 #version 330 core
 in  vec3  v_color;
 in  float v_saturation;
+in  float v_calm;
 out vec4  frag;
 void main() {
     vec2  uv = gl_PointCoord * 2.0 - 1.0;
@@ -225,7 +232,9 @@ void main() {
     float spec  = pow(max(dot(n, H), 0.0), 64.0) * 0.85;
     float rim   = pow(1.0 - nz, 3.5) * 0.55;
     vec3  col   = v_color * (0.10 + diff1 * 0.80 + diff2) + vec3(spec) + v_color * rim;
-    float alpha = smoothstep(1.0, 0.88, r2);
+    // Still fiducials: fully opaque sphere.  Moving: more transparent (particles take over).
+    float edge  = smoothstep(1.0, 0.88, r2);
+    float alpha = edge * (0.45 + v_calm * 0.55);
     frag = vec4(clamp(col, 0.0, 1.0), alpha);
 }
 """
@@ -686,19 +695,19 @@ class Renderer3D:
             [(self._particle_vbo, '3f 1f 1f 1f', 'a_pos', 'a_hue', 'a_bri', 'a_size')])
 
         # Fiducial sphere VBO + VAO (max 64 fiducials × 4 floats: x,y,z,hue)
-        self._sphere_vbo = ctx.buffer(reserve=64 * 4 * 4, dynamic=True)
+        self._sphere_vbo = ctx.buffer(reserve=256 * 5 * 4, dynamic=True)
         self._sphere_vao = ctx.vertex_array(
             progs['sphere'],
-            [(self._sphere_vbo, '3f 1f', 'a_pos', 'a_hue')])
+            [(self._sphere_vbo, '3f 1f 1f', 'a_pos', 'a_hue', 'a_calm')])
 
         # Overlay VBO + VAO (ribbons/halos — 2-D NDC)
-        self._overlay_vbo = ctx.buffer(reserve=60_000 * 6 * 4, dynamic=True)
+        self._overlay_vbo = ctx.buffer(reserve=200_000 * 6 * 4, dynamic=True)
         self._overlay_vao = ctx.vertex_array(
             progs['overlay'],
             [(self._overlay_vbo, '2f 4f', 'a_pos', 'a_color')])
 
         # Velocity bars — dedicated buffer (64 fids × 18 verts × 6 floats × 4 bytes)
-        self._bar_vbo = ctx.buffer(reserve=64 * 18 * 6 * 4, dynamic=True)
+        self._bar_vbo = ctx.buffer(reserve=256 * 18 * 6 * 4, dynamic=True)
         self._bar_vao = ctx.vertex_array(
             progs['overlay'],
             [(self._bar_vbo, '2f 4f', 'a_pos', 'a_color')])
@@ -926,13 +935,16 @@ class Renderer3D:
 
     # ── overlays ──────────────────────────────────────────────────────────────
 
-    def draw_fiducial_spheres(self, fid_3d: list,
+    def draw_fiducial_spheres(self, fid_3d: list, fid_calms: list,
                               sub_bass: float = 0.0, beat: float = 0.0) -> None:
         """Render each fiducial as a perspective-correct lit sphere point sprite."""
         if not fid_3d:
             return
+        max_fids = self._sphere_vbo.size // (5 * 4)
+        fid_3d   = fid_3d[:max_fids]
+        calms    = fid_calms[:max_fids] if fid_calms else [0.0] * len(fid_3d)
         data = np.array(
-            [[wx, wy, wz, fh] for wx, wy, wz, fh in fid_3d],
+            [[wx, wy, wz, fh, calms[i]] for i, (wx, wy, wz, fh) in enumerate(fid_3d)],
             dtype=np.float32,
         ).tobytes()
         self._sphere_vbo.write(data)
@@ -1002,7 +1014,7 @@ class Renderer3D:
         for first, count in segments:
             self._overlay_vao.render(moderngl.LINE_STRIP, vertices=count, first=first)
 
-    def draw_halos(self, fid_3d: list, t: float,
+    def draw_halos(self, fid_3d: list, fid_calms: list, t: float,
                    pulse: float, width: int, height: int,
                    sub_bass: float = 0.0, beat: float = 0.0) -> None:
         if not fid_3d:
@@ -1012,14 +1024,16 @@ class Renderer3D:
         SEGS = 48
         max_verts = self._overlay_vbo.size // (6 * 4)
 
-        for wx, wy, wz, fh in fid_3d:
+        for i, (wx, wy, wz, fh) in enumerate(fid_3d):
+            calm = fid_calms[i] if i < len(fid_calms) else 0.0
             sx, sy = world_to_screen(wx, wy, wz, width, height)
             depth  = wz + 1.0
             # Per-fiducial slow breathe — hue gives a unique phase so they desync
             phase_off  = fh * math.tau
             breathe    = 0.30 * math.sin(t * 0.45 + phase_off)
             local_sub  = max(0.0, sub_bass + breathe)
-            base_r = (22 + local_sub * 22 + beat * 12) / depth
+            # Still fiducials get a bigger, brighter halo
+            base_r = (22 + calm * 18 + local_sub * 22 + beat * 12) / depth
             r, g, b_c = _hue_to_rgb_f(fh)
             # Slowly drifting corona — gentle, lazy rotation
             for ring_i, (ring_scale, spin_dir, spin_speed) in enumerate([
@@ -1028,7 +1042,7 @@ class Renderer3D:
                     (1.15, 1.0, 0.03),
             ]):
                 rr    = base_r * ring_scale * (1.0 + beat * 0.22)
-                alpha = (0.65 - ring_i * 0.15) * (0.40 + local_sub * 0.35)
+                alpha = (0.65 - ring_i * 0.15) * (0.30 + calm * 0.35 + local_sub * 0.25)
                 start = len(verts) // 6
                 if start + SEGS + 1 > max_verts:
                     break
@@ -1153,6 +1167,8 @@ class Renderer3D:
         if not verts:
             return
         data = np.array(verts, np.float32).tobytes()
+        if len(data) > self._bar_vbo.size:
+            data = data[:self._bar_vbo.size - (self._bar_vbo.size % (18 * 6 * 4))]
         self._bar_vbo.write(data)
         self._ctx.screen.use()
         self._use_full()
