@@ -202,9 +202,10 @@ void main() {
     gl_Position  = u_mvp * vec4(a_pos, 1.0);
     float depth  = max(gl_Position.w, 0.1);
     // Still fiducials: bigger steady dot.  Moving: normal, audio-reactive.
+    float beat_sharp = u_beat * u_beat;   // squared → punchy contrast
     float base   = 28.0 + a_calm * 22.0
-                        + u_sub_bass * 20.0 * (1.0 - a_calm * 0.5)
-                        + u_beat * 10.0;
+                        + u_sub_bass * 8.0 * (1.0 - a_calm * 0.5)
+                        + beat_sharp * 28.0;
     gl_PointSize = base / depth;
     v_color      = hsv2rgb(a_hue, 0.82, 1.0);
     v_saturation = 0.82;
@@ -636,6 +637,13 @@ class Renderer3D:
         self._voronoi_fids:  Optional[np.ndarray] = None
         self._voronoi_tex:   Optional[moderngl.Texture] = None
         self._image_tex:     Optional[moderngl.Texture] = None
+        # Cached precomputed arrays (static for renderer lifetime)
+        self._energy_gx:    Optional[np.ndarray] = None
+        self._energy_gy:    Optional[np.ndarray] = None
+        self._halo_base_angles: Optional[np.ndarray] = None
+        # Aurora ribbon Delaunay cache
+        self._aurora_n:     int = -1
+        self._aurora_pairs: list = []
 
     # ── init ──────────────────────────────────────────────────────────────────
 
@@ -716,6 +724,12 @@ class Renderer3D:
         self._energy_tex = ctx.texture(
             (self._energy_lw, self._energy_lh), 1, dtype='f4')
         self._energy_tex.filter = moderngl.LINEAR, moderngl.LINEAR
+
+        # Precomputed grids — static for the lifetime of this renderer
+        xi = np.linspace(-WX, WX, self._energy_lw, dtype=np.float32)
+        yi = np.linspace(-WY, WY, self._energy_lh, dtype=np.float32)
+        self._energy_gx, self._energy_gy = np.meshgrid(xi, yi)
+        self._halo_base_angles = np.linspace(0.0, 2*math.pi, 49, dtype=np.float32)
 
         # Voronoi texture (RGB8, 1/8 res — upscaled by GPU bilinear)
         lw, lh = self._energy_lw, self._energy_lh
@@ -920,9 +934,7 @@ class Renderer3D:
         if len(fid_world_energies) > 12:
             fid_world_energies = sorted(fid_world_energies,
                                         key=lambda e: e[3], reverse=True)[:12]
-        xi = np.linspace(-WX, WX, lw, dtype=np.float32)
-        yi = np.linspace(-WY, WY, lh, dtype=np.float32)
-        GX, GY = np.meshgrid(xi, yi)
+        GX, GY = self._energy_gx, self._energy_gy
         sig_x = WX * 0.28;  sig_y = WY * 0.28
         for wx, wy, wz, energy in fid_world_energies:
             if energy < 0.02:
@@ -960,23 +972,28 @@ class Renderer3D:
             return
         fid_screen = [(world_to_screen(wx, wy, wz, width, height), fh)
                       for wx, wy, wz, fh in fid_3d]
-        try:
-            if len(fid_screen) >= 3:
-                from scipy.spatial import Delaunay
-                pts = np.array([s for s, _ in fid_screen])
-                tri = Delaunay(pts)
-                seen: set = set()
-                pairs = []
-                for simp in tri.simplices:
-                    for a, b in [(0,1),(1,2),(0,2)]:
-                        e = (min(simp[a],simp[b]), max(simp[a],simp[b]))
-                        if e not in seen:
-                            seen.add(e); pairs.append(e)
-            else:
-                pairs = [(0, 1)]
-        except Exception:
-            pairs = [(i,j) for i in range(len(fid_screen))
-                     for j in range(i+1, len(fid_screen))]
+        n = len(fid_screen)
+        if n != self._aurora_n:
+            try:
+                if n >= 3:
+                    from scipy.spatial import Delaunay
+                    pts = np.array([s for s, _ in fid_screen])
+                    tri = Delaunay(pts)
+                    seen: set = set()
+                    pairs: list = []
+                    for simp in tri.simplices:
+                        for a, b in [(0,1),(1,2),(0,2)]:
+                            e = (min(simp[a],simp[b]), max(simp[a],simp[b]))
+                            if e not in seen:
+                                seen.add(e); pairs.append(e)
+                else:
+                    pairs = [(0, 1)]
+            except Exception:
+                pairs = [(i,j) for i in range(n)
+                         for j in range(i+1, n)]
+            self._aurora_pairs = pairs
+            self._aurora_n = n
+        pairs = self._aurora_pairs
 
         verts = []
         segments: list = []
@@ -998,7 +1015,7 @@ class Renderer3D:
                 tt    = ki / (N - 1)
                 bx    = (1-tt)**2*sx0 + 2*(1-tt)*tt*mid_x + tt**2*sx1
                 by    = (1-tt)**2*sy0 + 2*(1-tt)*tt*mid_y + tt**2*sy1
-                alpha = math.sin(tt * math.pi) * 0.55
+                alpha = math.sin(tt * math.pi) * 0.40
                 hue   = (fh0 * (1-tt) + fh1 * tt) % 1.0
                 r, g, b_c = _hue_to_rgb_f(hue)
                 nx = bx / width  * 2 - 1
@@ -1019,56 +1036,66 @@ class Renderer3D:
                    sub_bass: float = 0.0, beat: float = 0.0) -> None:
         if not fid_3d:
             return
-        verts = []
-        segments: list = []
         SEGS = 48
-        max_verts = self._overlay_vbo.size // (6 * 4)
+        max_verts   = self._overlay_vbo.size // (6 * 4)
+        base_angles = self._halo_base_angles   # (SEGS+1,) float32 — precomputed
+        all_blocks: list = []
+        segments:   list = []
+        total_verts = 0
 
         for i, (wx, wy, wz, fh) in enumerate(fid_3d):
             calm = fid_calms[i] if i < len(fid_calms) else 0.0
             sx, sy = world_to_screen(wx, wy, wz, width, height)
-            depth  = wz + 1.0
-            # Per-fiducial slow breathe — hue gives a unique phase so they desync
+            depth      = wz + 1.0
             phase_off  = fh * math.tau
             breathe    = 0.30 * math.sin(t * 0.45 + phase_off)
             local_sub  = max(0.0, sub_bass + breathe)
-            # Still fiducials get a bigger, brighter halo
-            base_r = (22 + calm * 18 + local_sub * 22 + beat * 12) / depth
+            beat_sharp = beat * beat
+            base_r = (22 + calm * 18 + local_sub * 8 + beat_sharp * 28) / depth
             r, g, b_c = _hue_to_rgb_f(fh)
-            # Slowly drifting corona — gentle, lazy rotation
+
+            # Corona rings — vectorized per ring
             for ring_i, (ring_scale, spin_dir, spin_speed) in enumerate([
                     (0.6,  1.0, 0.10),
                     (0.9, -1.0, 0.06),
                     (1.15, 1.0, 0.03),
             ]):
-                rr    = base_r * ring_scale * (1.0 + beat * 0.22)
-                alpha = (0.65 - ring_i * 0.15) * (0.30 + calm * 0.35 + local_sub * 0.25)
-                start = len(verts) // 6
-                if start + SEGS + 1 > max_verts:
+                if total_verts + SEGS + 1 > max_verts:
                     break
-                for ki in range(SEGS + 1):
-                    angle = 2*math.pi*ki/SEGS + t * spin_speed * spin_dir + ring_i * 1.1
-                    nx = (sx + math.cos(angle) * rr) / width  * 2 - 1
-                    ny = 1 - (sy + math.sin(angle) * rr) / height * 2
-                    verts.extend([nx, ny, r, g, b_c, alpha])
-                segments.append((start, SEGS + 1))
-            # Outer glow rings
-            for ring_scale in (1.6, 2.4, 3.8):
-                rr    = base_r * ring_scale
-                alpha = 0.28 / ring_scale * (1.0 + local_sub * 0.8)
-                start = len(verts) // 6
-                if start + SEGS + 1 > max_verts:
-                    break
-                for ki in range(SEGS + 1):
-                    angle = 2*math.pi*ki/SEGS + t * 0.15
-                    nx = (sx + math.cos(angle) * rr) / width  * 2 - 1
-                    ny = 1 - (sy + math.sin(angle) * rr) / height * 2
-                    verts.extend([nx, ny, r, g, b_c, alpha])
-                segments.append((start, SEGS + 1))
+                rr    = base_r * ring_scale * (1.0 + beat_sharp * 0.35)
+                alpha = (0.50 - ring_i * 0.13) * (0.30 + calm * 0.35 + local_sub * 0.10 + beat_sharp * 0.30)
+                angles = base_angles + (t * spin_speed * spin_dir + ring_i * 1.1)
+                nxs = (sx + np.cos(angles) * rr) / width  * 2 - 1
+                nys = 1 - (sy + np.sin(angles) * rr) / height * 2
+                block = np.empty((SEGS + 1, 6), np.float32)
+                block[:, 0] = nxs;  block[:, 1] = nys
+                block[:, 2] = r;    block[:, 3] = g
+                block[:, 4] = b_c;  block[:, 5] = alpha
+                all_blocks.append(block)
+                segments.append((total_verts, SEGS + 1))
+                total_verts += SEGS + 1
 
-        if not verts:
+            # Outer glow rings — share a single cos/sin computation
+            angles_outer = base_angles + t * 0.15
+            cos_o = np.cos(angles_outer);  sin_o = np.sin(angles_outer)
+            for ring_scale in (1.6, 2.4, 3.8):
+                if total_verts + SEGS + 1 > max_verts:
+                    break
+                rr    = base_r * ring_scale
+                alpha = 0.22 / ring_scale * (1.0 + local_sub * 0.8)
+                nxs = (sx + cos_o * rr) / width  * 2 - 1
+                nys = 1 - (sy + sin_o * rr) / height * 2
+                block = np.empty((SEGS + 1, 6), np.float32)
+                block[:, 0] = nxs;  block[:, 1] = nys
+                block[:, 2] = r;    block[:, 3] = g
+                block[:, 4] = b_c;  block[:, 5] = alpha
+                all_blocks.append(block)
+                segments.append((total_verts, SEGS + 1))
+                total_verts += SEGS + 1
+
+        if not all_blocks:
             return
-        data = np.array(verts, np.float32).tobytes()
+        data = np.concatenate(all_blocks).tobytes()
         self._overlay_vbo.write(data)
         self._ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE
         for first, count in segments:
@@ -1194,7 +1221,7 @@ class Renderer3D:
             if age >= LIFETIME:
                 continue
             frac = age / LIFETIME
-            alpha = (1.0 - frac) ** 1.5 * 0.9
+            alpha = (1.0 - frac) ** 1.5 * 0.65
             radius = frac * 1.1
             for ring_i in range(2):
                 r_off = radius + ring_i * 0.025

@@ -22,6 +22,7 @@ DEPTH_SCALE default 250 000 gives ~1250 mm for a 200 px-tall person at 720 p.
 Increase for a larger room / farther camera; decrease if people are very close.
 """
 import math
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -85,6 +86,12 @@ class RGBCameraTracker(TrackerBase):
         self._tracked: Dict[int, Tuple[float, float]] = {}
         self._next_pid = 0
 
+        # Background inference thread state
+        self._latest_frame: Frame = Frame()
+        self._lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
     # ── lifecycle ───────────────────────────────────────────────────────────────
 
     def open(self) -> None:
@@ -119,107 +126,115 @@ class RGBCameraTracker(TrackerBase):
               f"(auto-downloads ~6 MB on first run)…")
         self._model = YOLO(self._model_name + '.pt')
 
-        self._last_tick = time.perf_counter()
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._inference_loop, daemon=True)
+        self._thread.start()
         print(f"[RGBCameraTracker] ready  conf={_DET_CONF}  "
               f"fps_target={self._fps}  depth_scale={self._depth_scale:.0f}")
 
     def get_frame(self) -> Frame:
-        # Pace to target fps
-        if self._dt > 0:
-            wait = self._dt - (time.perf_counter() - self._last_tick)
-            if wait > 0:
-                time.sleep(wait)
-        self._last_tick = time.perf_counter()
+        """Return the latest frame produced by the background inference thread."""
+        with self._lock:
+            return self._latest_frame
 
-        ret, frame = self._cap.read()
-        if not ret:
-            return Frame(frame_index=self._frame_idx)
+    def _inference_loop(self) -> None:
+        """Background thread: capture → YOLO → update latest frame."""
+        last_tick = time.perf_counter()
+        while not self._stop_event.is_set():
+            # Pace to target fps
+            if self._dt > 0:
+                wait = self._dt - (time.perf_counter() - last_tick)
+                if wait > 0:
+                    time.sleep(wait)
+            last_tick = time.perf_counter()
 
-        results = self._model(frame, conf=_DET_CONF, verbose=False)
-        raw_frame = frame  # keep for debug overlay
-
-        # ── collect detections ────────────────────────────────────────────────
-        # Each entry: (norm_cx, norm_cy, kp_pixels [17,2], kp_conf [17], box_h_px)
-        detections: List[Tuple] = []
-        for result in results:
-            if result.keypoints is None or result.boxes is None:
+            ret, img = self._cap.read()
+            if not ret:
                 continue
-            boxes    = result.boxes.xyxy.cpu().numpy()      # [N, 4]
-            kps      = result.keypoints.xy.cpu().numpy()    # [N, 17, 2]
-            kp_confs = result.keypoints.conf                # [N, 17] or None
-            if kp_confs is not None:
-                kp_confs = kp_confs.cpu().numpy()
-            else:
-                kp_confs = np.ones((len(boxes), 17), dtype=np.float32)
 
-            for i in range(len(boxes)):
-                x1, y1, x2, y2 = boxes[i]
-                box_h = max(float(y2 - y1), 1.0)
-                cx    = float((x1 + x2) / 2) / self._frame_w
-                cy    = float((y1 + y2) / 2) / self._frame_h
-                detections.append((cx, cy, kps[i], kp_confs[i], box_h))
+            results = self._model(img, conf=_DET_CONF, verbose=False)
+            raw_frame = img  # keep for debug overlay
 
-        # ── match detections to existing person IDs ───────────────────────────
-        assigned: Dict[int, int] = {}   # pid → det index
-        used: set = set()
-
-        for pid, (prev_cx, prev_cy) in list(self._tracked.items()):
-            best_d, best_i = float('inf'), -1
-            for i, (cx, cy, *_) in enumerate(detections):
-                if i in used:
+            # ── collect detections ────────────────────────────────────────────
+            detections: List[Tuple] = []
+            for result in results:
+                if result.keypoints is None or result.boxes is None:
                     continue
-                d = math.hypot(cx - prev_cx, cy - prev_cy)
-                if d < best_d:
-                    best_d, best_i = d, i
-            if best_i >= 0 and best_d <= _MAX_MATCH_DIST:
-                assigned[pid] = best_i
-                used.add(best_i)
+                boxes    = result.boxes.xyxy.cpu().numpy()
+                kps      = result.keypoints.xy.cpu().numpy()
+                kp_confs = result.keypoints.conf
+                if kp_confs is not None:
+                    kp_confs = kp_confs.cpu().numpy()
+                else:
+                    kp_confs = np.ones((len(boxes), 17), dtype=np.float32)
 
-        # New IDs for unmatched detections
-        for i in range(len(detections)):
-            if i not in used:
-                pid = self._next_pid
-                self._next_pid += 1
-                assigned[pid] = i
+                for i in range(len(boxes)):
+                    x1, y1, x2, y2 = boxes[i]
+                    box_h = max(float(y2 - y1), 1.0)
+                    cx    = float((x1 + x2) / 2) / self._frame_w
+                    cy    = float((y1 + y2) / 2) / self._frame_h
+                    detections.append((cx, cy, kps[i], kp_confs[i], box_h))
 
-        # Remove lost IDs
-        for pid in list(self._tracked):
-            if pid not in assigned:
-                del self._tracked[pid]
+            # ── match detections to existing person IDs ───────────────────────
+            assigned: Dict[int, int] = {}
+            used: set = set()
 
-        # ── emit fiducials ────────────────────────────────────────────────────
-        fiducials: List[Fiducial3D] = []
-        for pid, det_i in assigned.items():
-            cx, cy, kp, kp_conf, box_h = detections[det_i]
-            self._tracked[pid] = (cx, cy)
+            for pid, (prev_cx, prev_cy) in list(self._tracked.items()):
+                best_d, best_i = float('inf'), -1
+                for i, (cx, cy, *_) in enumerate(detections):
+                    if i in used:
+                        continue
+                    d = math.hypot(cx - prev_cx, cy - prev_cy)
+                    if d < best_d:
+                        best_d, best_i = d, i
+                if best_i >= 0 and best_d <= _MAX_MATCH_DIST:
+                    assigned[pid] = best_i
+                    used.add(best_i)
 
-            z_mm = float(np.clip(self._depth_scale / box_h, _Z_MIN, _Z_MAX))
+            for i in range(len(detections)):
+                if i not in used:
+                    pid = self._next_pid
+                    self._next_pid += 1
+                    assigned[pid] = i
 
-            # slot 0 — head: prefer nose; fall back to ear midpoint; then box top
-            if kp_conf[_NOSE] >= _KP_CONF_MIN:
-                self._emit(fiducials, kp, kp_conf, _NOSE, pid, 0, z_mm)
-            else:
-                # any visible ear as fallback
-                for ear_kp in (_L_EAR, _R_EAR):
-                    if kp_conf[ear_kp] >= _KP_CONF_MIN:
-                        self._emit(fiducials, kp, kp_conf, ear_kp, pid, 0, z_mm)
-                        break
+            for pid in list(self._tracked):
+                if pid not in assigned:
+                    del self._tracked[pid]
 
-            # slot 1 — left shoulder
-            self._emit(fiducials, kp, kp_conf, _L_SHOULDER, pid, 1, z_mm)
+            # ── emit fiducials ────────────────────────────────────────────────
+            fiducials: List[Fiducial3D] = []
+            for pid, det_i in assigned.items():
+                cx, cy, kp, kp_conf, box_h = detections[det_i]
+                self._tracked[pid] = (cx, cy)
 
-            # slot 2 — right shoulder
-            self._emit(fiducials, kp, kp_conf, _R_SHOULDER, pid, 2, z_mm)
+                z_mm = float(np.clip(self._depth_scale / box_h, _Z_MIN, _Z_MAX))
 
-        if self._debug:
-            self._show_debug(results, raw_frame, assigned, detections)
+                if kp_conf[_NOSE] >= _KP_CONF_MIN:
+                    self._emit(fiducials, kp, kp_conf, _NOSE, pid, 0, z_mm)
+                else:
+                    for ear_kp in (_L_EAR, _R_EAR):
+                        if kp_conf[ear_kp] >= _KP_CONF_MIN:
+                            self._emit(fiducials, kp, kp_conf, ear_kp, pid, 0, z_mm)
+                            break
 
-        ts = int(time.perf_counter() * 1_000_000)
-        self._frame_idx += 1
-        return Frame(fiducials=fiducials, timestamp_us=ts,
-                     frame_index=self._frame_idx)
+                self._emit(fiducials, kp, kp_conf, _L_SHOULDER, pid, 1, z_mm)
+                self._emit(fiducials, kp, kp_conf, _R_SHOULDER, pid, 2, z_mm)
+
+            if self._debug:
+                self._show_debug(results, raw_frame, assigned, detections)
+
+            ts = int(time.perf_counter() * 1_000_000)
+            self._frame_idx += 1
+            frame = Frame(fiducials=fiducials, timestamp_us=ts,
+                          frame_index=self._frame_idx)
+            with self._lock:
+                self._latest_frame = frame
 
     def close(self) -> None:
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
         if self._cap is not None:
             self._cap.release()
             self._cap = None

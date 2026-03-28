@@ -122,23 +122,30 @@ class Visualizer:
         pygame.display.set_caption(self._title)
         flags = pygame.OPENGL | pygame.DOUBLEBUF
         if self._fullscreen:
+            # Pass (0,0) so pygame picks the native desktop resolution
             flags |= pygame.FULLSCREEN
+            self._screen = pygame.display.set_mode((0, 0), flags)
+            self.width, self.height = self._screen.get_size()
+            # Force window above the taskbar (Windows keeps taskbar on top otherwise)
+            import ctypes
+            hwnd = pygame.display.get_wm_info()['window']
+            HWND_TOPMOST = -1
+            SWP_NOMOVE_NOSIZE = 0x0003
+            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE_NOSIZE)
         else:
             flags |= pygame.RESIZABLE
-        self._screen = pygame.display.set_mode((self.width, self.height), flags)
-        self._clock  = pygame.time.Clock()
-
-        if self._maximize:
-            import ctypes
-            import ctypes.wintypes
-            hwnd = pygame.display.get_wm_info()['window']
-            ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
-            # Read actual client area so the renderer uses the real pixel dimensions
-            rect = ctypes.wintypes.RECT()
-            ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
-            w, h = rect.right - rect.left, rect.bottom - rect.top
-            if w > 0 and h > 0:
-                self.width, self.height = w, h
+            self._screen = pygame.display.set_mode((self.width, self.height), flags)
+            if self._maximize:
+                import ctypes
+                import ctypes.wintypes
+                hwnd = pygame.display.get_wm_info()['window']
+                ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
+                rect = ctypes.wintypes.RECT()
+                ctypes.windll.user32.GetClientRect(hwnd, ctypes.byref(rect))
+                w, h = rect.right - rect.left, rect.bottom - rect.top
+                if w > 0 and h > 0:
+                    self.width, self.height = w, h
+        self._clock = pygame.time.Clock()
 
         self._ctx      = moderngl.create_context()
         self._renderer = Renderer3D(self._ctx, self.width, self.height)
