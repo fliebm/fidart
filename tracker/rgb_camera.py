@@ -152,30 +152,32 @@ class RGBCameraTracker(TrackerBase):
             if not ret:
                 continue
 
-            import cv2
-            img = cv2.flip(img, 0)    # vertical flip
+            # YOLO runs on the original unflipped frame for best accuracy.
+            # After detection, Y coordinates are flipped for presentation.
+            results   = self._model(img, conf=_DET_CONF, verbose=False)
+            raw_frame = img
 
-            results = self._model(img, conf=_DET_CONF, verbose=False)
-            raw_frame = img  # keep for debug overlay
-
-            # ── collect detections ────────────────────────────────────────────
+            # ── collect detections (Y-flip applied to coordinates) ────────────
             detections: List[Tuple] = []
             for result in results:
                 if result.keypoints is None or result.boxes is None:
                     continue
                 boxes    = result.boxes.xyxy.cpu().numpy()
-                kps      = result.keypoints.xy.cpu().numpy()
+                kps      = result.keypoints.xy.cpu().numpy().copy()
                 kp_confs = result.keypoints.conf
                 if kp_confs is not None:
                     kp_confs = kp_confs.cpu().numpy()
                 else:
                     kp_confs = np.ones((len(boxes), 17), dtype=np.float32)
 
+                # Flip Y axis of all keypoints for presentation
+                kps[:, :, 1] = self._frame_h - kps[:, :, 1]
+
                 for i in range(len(boxes)):
                     x1, y1, x2, y2 = boxes[i]
                     box_h = max(float(y2 - y1), 1.0)
                     cx    = float((x1 + x2) / 2) / self._frame_w
-                    cy    = float((y1 + y2) / 2) / self._frame_h
+                    cy    = 1.0 - float((y1 + y2) / 2) / self._frame_h   # flip Y
                     detections.append((cx, cy, kps[i], kp_confs[i], box_h))
 
             # ── match detections to existing person IDs ───────────────────────
