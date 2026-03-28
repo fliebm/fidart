@@ -152,6 +152,9 @@ class RGBCameraTracker(TrackerBase):
             if not ret:
                 continue
 
+            import cv2
+            img = cv2.flip(img, 1)    # horizontal mirror
+
             results = self._model(img, conf=_DET_CONF, verbose=False)
             raw_frame = img  # keep for debug overlay
 
